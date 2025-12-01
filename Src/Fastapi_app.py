@@ -128,7 +128,7 @@ class PricingEngine:
                 'competitor_price': input_data.get('competitor_price', input_data.get('current_price', 5000)),
                 'is_weekend': 1 if input_data.get('is_weekend', False) else 0,
                 'booking_urgency': 1 / (input_data.get('days_left', 30) + 1),
-                'route_popularity': 1000,  # Simulated
+                'route_popularity': 1000,
             }
             
             processed_data.update(numerical_features)
@@ -217,3 +217,219 @@ class PricingEngine:
             
         return factors
 
+pricing_engine = PricingEngine()
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize model on startup"""
+    logger.info("Starting up Dynamic Pricing API")
+    if not pricing_engine.load_model():
+        logger.error("Failed to load model during startup")
+        raise RuntimeError("Model loading failed")
+
+@app.get("/", summary="API Root", tags=["General"])
+async def root():
+    """API root endpoint"""
+    return {
+        "message": "Dynamic Flight Pricing API",
+        "version": "1.0.0",
+        "status": "operational",
+        "documentation": "/docs"
+    }
+
+@app.get("/health", response_model=HealthResponse, tags=["Monitoring"])
+async def health_check():
+    """Health check endpoint"""
+    return HealthResponse(
+        status="healthy" if pricing_engine.is_loaded else "unhealthy",
+        model_loaded=pricing_engine.is_loaded,
+        model_type=pricing_engine.model_artifacts['model_type'] if pricing_engine.is_loaded else None,
+        timestamp=datetime.now().isoformat()
+    )
+
+@app.get("/model/info", tags=["Model"])
+async def get_model_info():
+    """Get information about the loaded model"""
+    if not pricing_engine.is_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    metrics = pricing_engine.model_artifacts['performance_metrics']
+    business_metrics = pricing_engine.model_artifacts['business_metrics']
+    
+    return {
+        "model_type": pricing_engine.model_artifacts['model_type'],
+        "feature_count": len(pricing_engine.feature_columns),
+        "performance_metrics": {
+            "rmse": round(metrics['rmse'], 2),
+            "mape": round(metrics['mape'], 2),
+            "r2_score": round(metrics['r2'], 4)
+        },
+        "business_metrics": {
+            "revenue_uplift": round(business_metrics['revenue_uplift'], 2),
+            "avg_price_change": round(business_metrics['avg_price_change'], 2)
+        },
+        "loaded_at": "startup"
+    }
+
+@app.post("/pricing/predict", response_model=PricingResponse, tags=["Pricing"])
+async def predict_pricing(flight_data: FlightData):
+    """
+    Predict optimal price for a single flight
+    
+    - **flight_data**: Flight information including current price, competitor data, and flight details
+    - **returns**: Optimal pricing recommendation with analysis
+    """
+    if not pricing_engine.is_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    try:
+        input_dict = flight_data.dict()
+
+        constrained_price, raw_optimal_price = pricing_engine.predict_optimal_price(input_dict)
+
+        recommendation, price_change = pricing_engine.get_pricing_recommendation(
+            flight_data.current_price, constrained_price
+        )
+        factors = pricing_engine.analyze_pricing_factors(input_dict, constrained_price)
+        
+        logger.info(f"Pricing prediction for flight {flight_data.flight_id}: "
+                   f"current={flight_data.current_price}, optimal={constrained_price}, "
+                   f"change={price_change:.2f}%")
+        
+        return PricingResponse(
+            flight_id=flight_data.flight_id,
+            current_price=flight_data.current_price,
+            optimal_price=round(constrained_price, 2),
+            price_change_percent=round(price_change, 2),
+            recommendation=recommendation,
+            timestamp=datetime.now().isoformat(),
+            factors=factors
+        )
+        
+    except Exception as e:
+        logger.error(f"Pricing prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Pricing prediction failed: {str(e)}")
+
+@app.post("/pricing/predict/batch", response_model=BatchPricingResponse, tags=["Pricing"])
+async def predict_batch_pricing(batch_request: BatchPricingRequest):
+    """
+    Predict optimal prices for multiple flights in batch
+    
+    - **batch_request**: List of flight data objects
+    - **returns**: Batch pricing predictions with summary statistics
+    """
+    if not pricing_engine.is_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    try:
+        predictions = []
+        total_flights = len(batch_request.flights)
+        
+        logger.info(f"Processing batch pricing for {total_flights} flights")
+        
+        for i, flight_data in enumerate(batch_request.flights):
+            try:
+                input_dict = flight_data.dict()
+                constrained_price, raw_optimal_price = pricing_engine.predict_optimal_price(input_dict)
+                recommendation, price_change = pricing_engine.get_pricing_recommendation(
+                    flight_data.current_price, constrained_price
+                )
+                factors = pricing_engine.analyze_pricing_factors(input_dict, constrained_price)
+                
+                predictions.append(PricingResponse(
+                    flight_id=flight_data.flight_id,
+                    current_price=flight_data.current_price,
+                    optimal_price=round(constrained_price, 2),
+                    price_change_percent=round(price_change, 2),
+                    recommendation=recommendation,
+                    timestamp=datetime.now().isoformat(),
+                    factors=factors
+                ))
+                
+                if total_flights > 100 and (i + 1) % 100 == 0:
+                    logger.info(f"Processed {i + 1}/{total_flights} flights")
+                    
+            except Exception as e:
+                logger.error(f"Error processing flight {flight_data.flight_id}: {e}")
+
+                predictions.append(PricingResponse(
+                    flight_id=flight_data.flight_id,
+                    current_price=flight_data.current_price,
+                    optimal_price=flight_data.current_price,  # Fallback to current price
+                    price_change_percent=0.0,
+                    recommendation="ERROR",
+                    timestamp=datetime.now().isoformat(),
+                    factors=[f"Pricing error: {str(e)}"]
+                ))
+
+        successful_predictions = [p for p in predictions if p.recommendation != "ERROR"]
+        if successful_predictions:
+            avg_price_change = sum(p.price_change_percent for p in successful_predictions) / len(successful_predictions)
+            price_increases = sum(1 for p in successful_predictions if p.price_change_percent > 5)
+            price_decreases = sum(1 for p in successful_predictions if p.price_change_percent < -5)
+            total_revenue_impact = sum(
+                (p.optimal_price - p.current_price) for p in successful_predictions
+            )
+        else:
+            avg_price_change = price_increases = price_decreases = total_revenue_impact = 0
+        
+        logger.info(f"Batch pricing completed: {len(successful_predictions)} successful, "
+                   f"avg_change={avg_price_change:.2f}%")
+        
+        return BatchPricingResponse(
+            predictions=predictions,
+            summary={
+                "total_flights": total_flights,
+                "successful_predictions": len(successful_predictions),
+                "failed_predictions": total_flights - len(successful_predictions),
+                "average_price_change_percent": round(avg_price_change, 2),
+                "flights_with_price_increases": price_increases,
+                "flights_with_price_decreases": price_decreases,
+                "total_revenue_impact": round(total_revenue_impact, 2)
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Batch pricing error: {e}")
+        raise HTTPException(status_code=500, detail=f"Batch pricing failed: {str(e)}")
+
+@app.post("/model/reload", tags=["Model"])
+async def reload_model(background_tasks: BackgroundTasks):
+    """
+    Reload the model (admin endpoint)
+    
+    Useful when model files are updated without restarting the API
+    """
+    def reload_model_task():
+        pricing_engine.load_model()
+    
+    background_tasks.add_task(reload_model_task)
+    
+    return {
+        "message": "Model reload initiated",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    """Middleware to log all requests"""
+    start_time = datetime.now()
+    
+    response = await call_next(request)
+    
+    process_time = (datetime.now() - start_time).total_seconds()
+    logger.info(f"{request.method} {request.url.path} - "
+               f"Status: {response.status_code} - "
+               f"Time: {process_time:.3f}s")
+    
+    return response
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )
